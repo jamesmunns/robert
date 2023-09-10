@@ -432,7 +432,10 @@ dependencies = [
  "atomic-polyfill 1.0.3",
  "cfg-if",
  "critical-section",
+ "defmt",
  "embedded-hal 0.2.7",
+ "embedded-hal 1.0.0-rc.1",
+ "embedded-hal-async",
  "futures-util",
  "heapless",
 ]
@@ -1115,6 +1118,7 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-rp",
+ "embassy-time",
  "embassy-usb",
  "panic-probe",
 ]

@@ -6,12 +6,16 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+use embassy_time::Duration;
+
 use defmt::{info, panic};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{AnyPin, Level, Output};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, Instance, InterruptHandler};
+use embassy_time::Ticker;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
@@ -21,8 +25,40 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
+struct Rgb {
+    r: Output<'static, AnyPin>,
+    g: Output<'static, AnyPin>,
+    b: Output<'static, AnyPin>,
+}
+
+#[embassy_executor::task]
+async fn blink(mut rgb: Rgb) {
+    let Rgb { r, g, b } = &mut rgb;
+    let mut leds = [r, g, b];
+    let mut ctr = 0u8;
+
+    let mut ticker = Ticker::every(Duration::from_millis(250));
+
+    fn bool2lvl(active: bool) -> Level {
+        if active {
+            Level::Low
+        } else {
+            Level::High
+        }
+    }
+
+    loop {
+        ticker.next().await;
+        ctr = ctr.wrapping_add(1);
+        let vals = [ctr & 0b100 != 0, ctr & 0b010 != 0, ctr & 0b001 != 0];
+        leds.iter_mut().zip(vals).for_each(|(l, v)| {
+            l.set_level(bool2lvl(v));
+        });
+    }
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     info!("Hello there!");
 
     let p = embassy_rp::init(Default::default());
@@ -63,6 +99,24 @@ async fn main(_spawner: Spawner) {
         &mut control_buf,
     );
 
+    // Pins:
+    //
+    // * IO25 - Blue
+    // * IO16 - Green
+    // * IO17 - Red
+    // * IO11 - NEO PWR
+    // * IO12 - NEO PIX
+    let red = Output::new(AnyPin::from(p.PIN_17), Level::High);
+    let blue = Output::new(AnyPin::from(p.PIN_25), Level::High);
+    let green = Output::new(AnyPin::from(p.PIN_16), Level::High);
+    let rgb = Rgb {
+        r: red,
+        g: green,
+        b: blue,
+    };
+
+    spawner.spawn(blink(rgb)).unwrap();
+
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
 
@@ -98,7 +152,9 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
+async fn echo<'d, T: Instance + 'd>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+) -> Result<(), Disconnected> {
     let mut buf = [0; 64];
     loop {
         let n = class.read_packet(&mut buf).await?;
