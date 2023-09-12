@@ -5,21 +5,21 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 use embassy_time::Duration;
 
 use defmt::{info, panic};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{AnyPin, Level, Output};
-use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, Instance, InterruptHandler};
+use embassy_rp::{bind_interrupts, gpio::{AnyPin, Level, Output}, peripherals::USB, usb::{Driver, Instance, InterruptHandler}};
 use embassy_time::Ticker;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_usb::driver::EndpointError;
-use embassy_usb::{Builder, Config};
+use embassy_usb::{class::cdc_acm::{CdcAcmClass, State}, driver::EndpointError, Builder, Config};
+use forth::{INPIPE, OUTPIPE, RobertCtx};
+
+use crate::forth::run_forth;
 use {defmt_rtt as _, panic_probe as _};
+mod forth;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -116,6 +116,7 @@ async fn main(spawner: Spawner) {
     };
 
     spawner.spawn(blink(rgb)).unwrap();
+    spawner.spawn(run_forth(RobertCtx { })).unwrap();
 
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
@@ -127,18 +128,18 @@ async fn main(spawner: Spawner) {
     let usb_fut = usb.run();
 
     // Do stuff with the class!
-    let echo_fut = async {
+    let run_forth_fut = async {
         loop {
             class.wait_connection().await;
             info!("Connected");
-            let _ = echo(&mut class).await;
+            let _ = usb_forth(&mut class).await;
             info!("Disconnected");
         }
     };
 
     // Run everything concurrently.
     // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    join(usb_fut, echo_fut).await;
+    join(usb_fut, run_forth_fut).await;
 }
 
 struct Disconnected {}
@@ -152,14 +153,22 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(
+async fn usb_forth<'d, T: Instance + 'd>(
     class: &mut CdcAcmClass<'d, Driver<'d, T>>,
 ) -> Result<(), Disconnected> {
     let mut buf = [0; 64];
     loop {
-        let n = class.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-        info!("data: {:x}", data);
-        class.write_packet(data).await?;
+        match embassy_time::with_timeout(Duration::from_millis(10), class.read_packet(&mut buf)).await {
+            Ok(Ok(n)) => {
+                INPIPE.write_all(&buf[..n]).await;
+            },
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {},
+        }
+
+        while let Ok(n) = OUTPIPE.try_read(&mut buf) {
+            class.write_packet(&buf[..n]).await?;
+        }
+        // class.write_packet(data).await?;
     }
 }
