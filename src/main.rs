@@ -25,37 +25,37 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
-struct Rgb {
-    r: Output<'static, AnyPin>,
-    g: Output<'static, AnyPin>,
-    b: Output<'static, AnyPin>,
+pub struct Rgb {
+    pub r: Output<'static, AnyPin>,
+    pub g: Output<'static, AnyPin>,
+    pub b: Output<'static, AnyPin>,
 }
 
-#[embassy_executor::task]
-async fn blink(mut rgb: Rgb) {
-    let Rgb { r, g, b } = &mut rgb;
-    let mut leds = [r, g, b];
-    let mut ctr = 0u8;
+// #[embassy_executor::task]
+// async fn blink(mut rgb: Rgb) {
+//     let Rgb { r, g, b } = &mut rgb;
+//     let mut leds = [r, g, b];
+//     let mut ctr = 0u8;
 
-    let mut ticker = Ticker::every(Duration::from_millis(250));
+//     let mut ticker = Ticker::every(Duration::from_millis(250));
 
-    fn bool2lvl(active: bool) -> Level {
-        if active {
-            Level::Low
-        } else {
-            Level::High
-        }
-    }
+//     fn bool2lvl(active: bool) -> Level {
+//         if active {
+//             Level::Low
+//         } else {
+//             Level::High
+//         }
+//     }
 
-    loop {
-        ticker.next().await;
-        ctr = ctr.wrapping_add(1);
-        let vals = [ctr & 0b100 != 0, ctr & 0b010 != 0, ctr & 0b001 != 0];
-        leds.iter_mut().zip(vals).for_each(|(l, v)| {
-            l.set_level(bool2lvl(v));
-        });
-    }
-}
+//     loop {
+//         ticker.next().await;
+//         ctr = ctr.wrapping_add(1);
+//         let vals = [ctr & 0b100 != 0, ctr & 0b010 != 0, ctr & 0b001 != 0];
+//         leds.iter_mut().zip(vals).for_each(|(l, v)| {
+//             l.set_level(bool2lvl(v));
+//         });
+//     }
+// }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -115,8 +115,8 @@ async fn main(spawner: Spawner) {
         b: blue,
     };
 
-    spawner.spawn(blink(rgb)).unwrap();
-    spawner.spawn(run_forth(RobertCtx { })).unwrap();
+    // spawner.spawn(blink(rgb)).unwrap();
+    spawner.spawn(run_forth(RobertCtx { rgb })).unwrap();
 
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
