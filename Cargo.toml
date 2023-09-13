@@ -28,11 +28,14 @@ defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 
-# fixed = "1.23.1"
-# fixed-macro = "1.2"
+fixed = "1.23.1"
+fixed-macro = "1.2"
 
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7.0"
+pio = "0.2.1"
+heapless = "0.7.15"
+smart-leds = "0.3.0"
 
 # futures = { version = "0.3.17", default-features = false, features = ["async-await", "cfg-target-has-atomic", "unstable"] }
 # display-interface-spi = "0.4.1"
@@ -40,8 +43,6 @@ cortex-m-rt = "0.7.0"
 # st7789 = "0.6.1"
 # display-interface = "0.4.1"
 # byte-slice-cast = { version = "1.2.0", default-features = false }
-# smart-leds = "0.3.0"
-heapless = "0.7.15"
 # usbd-hid = "0.6.1"
 
 # embedded-hal-1 = { package = "embedded-hal", version = "=1.0.0-rc.1" }
@@ -52,7 +53,6 @@ heapless = "0.7.15"
 # static_cell = { version = "1.1", features = ["nightly"]}
 # log = "0.4"
 # pio-proc = "0.2"
-# pio = "0.2.1"
 # rand = { version = "0.8.5", default-features = false }
 
 [dependencies.portable-atomic]

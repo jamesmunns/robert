@@ -2,7 +2,7 @@ use core::{
     alloc::Layout, cell::UnsafeCell, future::Future, mem::MaybeUninit, ptr::NonNull, unreachable,
 };
 
-use embassy_rp::rom_data;
+use embassy_rp::{rom_data, peripherals::PIO0};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, pipe::Pipe};
 use embassy_time::Duration;
 use forth3::{
@@ -17,11 +17,13 @@ use forth3::{
     word::Word,
     AsyncForth, Buffers, CallContext, Forth,
 };
+use smart_leds::RGB8;
 
-use crate::Rgb;
+use crate::{Rgb, ws2812::{wheel, Ws2812}};
 
 pub struct RobertCtx {
     pub rgb: Rgb,
+    pub ws2812: Ws2812<'static, PIO0, 0, 1>,
 }
 
 pub struct RobertAlloc {}
@@ -77,6 +79,17 @@ fn led_off(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     Ok(())
 }
 
+fn conv_wheel(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let val = forth.data_stack.try_pop()?;
+    let val = unsafe { val.data } as u8;
+    let val = wheel(val);
+    let (red, green, blue): (u8, u8, u8) = val.into();
+    let val = [0, red, green, blue];
+    forth.data_stack.push(Word::data(i32::from_le_bytes(val)))?;
+    Ok(())
+}
+
+
 pub struct RobertAsync {}
 
 impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
@@ -87,6 +100,7 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
         async_builtin!("sleep::ms"),
         async_builtin!("reboot"),
         async_builtin!("flush"),
+        async_builtin!("set_smartled"),
     ];
 
     fn dispatch_async(
@@ -116,6 +130,14 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                 "flush" => {
                     OUTPIPE.write_all(forth.output.as_str().as_bytes()).await;
                     forth.output.clear();
+                    Ok(())
+                }
+                "set_smartled" => {
+                    let val = forth.data_stack.try_pop()?;
+                    let val = unsafe { val.data };
+                    let [_, r, g, b] = val.to_le_bytes();
+                    let data = RGB8 { r, g, b };
+                    forth.host_ctxt.ws2812.write(&[data]).await;
                     Ok(())
                 }
                 _ => Err(forth3::Error::WordNotInDict),
@@ -275,6 +297,7 @@ pub const ROBERT_BUILTINS: &[BuiltinEntry<RobertCtx>] = &[
     builtin!("red", red_const),
     builtin!("green", green_const),
     builtin!("blue", blue_const),
+    builtin!("wheel", conv_wheel),
     //
     // Math operations
     //

@@ -12,14 +12,15 @@ use embassy_time::Duration;
 use defmt::{info, panic};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_rp::{bind_interrupts, gpio::{AnyPin, Level, Output}, peripherals::USB, usb::{Driver, Instance, InterruptHandler}};
-use embassy_time::Ticker;
+use embassy_rp::{bind_interrupts, gpio::{AnyPin, Level, Output}, peripherals::USB, usb::{Driver, Instance, InterruptHandler}, pio::Pio};
 use embassy_usb::{class::cdc_acm::{CdcAcmClass, State}, driver::EndpointError, Builder, Config};
 use forth::{INPIPE, OUTPIPE, RobertCtx};
+use ws2812::Ws2812;
 
 use crate::forth::run_forth;
 use {defmt_rtt as _, panic_probe as _};
 mod forth;
+mod ws2812;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -30,32 +31,6 @@ pub struct Rgb {
     pub g: Output<'static, AnyPin>,
     pub b: Output<'static, AnyPin>,
 }
-
-// #[embassy_executor::task]
-// async fn blink(mut rgb: Rgb) {
-//     let Rgb { r, g, b } = &mut rgb;
-//     let mut leds = [r, g, b];
-//     let mut ctr = 0u8;
-
-//     let mut ticker = Ticker::every(Duration::from_millis(250));
-
-//     fn bool2lvl(active: bool) -> Level {
-//         if active {
-//             Level::Low
-//         } else {
-//             Level::High
-//         }
-//     }
-
-//     loop {
-//         ticker.next().await;
-//         ctr = ctr.wrapping_add(1);
-//         let vals = [ctr & 0b100 != 0, ctr & 0b010 != 0, ctr & 0b001 != 0];
-//         leds.iter_mut().zip(vals).for_each(|(l, v)| {
-//             l.set_level(bool2lvl(v));
-//         });
-//     }
-// }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -115,8 +90,21 @@ async fn main(spawner: Spawner) {
         b: blue,
     };
 
+    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, ws2812::Irqs);
+
+    // Common neopixel pins:
+    // Thing plus: 8
+    // Adafruit Feather: 16;  Adafruit Feather+RFM95: 4
+    let ws2812 = Ws2812::new(
+        &mut common,
+        sm0,
+        p.DMA_CH0,
+        p.PIN_12,
+        Output::new(AnyPin::from(p.PIN_11), Level::Low),
+    );
+
     // spawner.spawn(blink(rgb)).unwrap();
-    spawner.spawn(run_forth(RobertCtx { rgb })).unwrap();
+    spawner.spawn(run_forth(RobertCtx { rgb, ws2812 })).unwrap();
 
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
@@ -172,3 +160,4 @@ async fn usb_forth<'d, T: Instance + 'd>(
         // class.write_packet(data).await?;
     }
 }
+
