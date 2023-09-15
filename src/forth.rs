@@ -17,13 +17,26 @@ use forth3::{
     word::Word,
     AsyncForth, Buffers, CallContext, Forth,
 };
-use smart_leds::RGB8;
+use smart_leds::{RGB8, colors};
 
-use crate::{Rgb, ws2812::{wheel, Ws2812}};
+use crate::{Rgb, ws2812::{wheel, Ws2812, gamma_one, brightness_one}};
 
 pub struct RobertCtx {
     pub rgb: Rgb,
     pub ws2812: Ws2812<'static, PIO0, 0, 1>,
+    pub enable_gamma: bool,
+    pub brightness: u8,
+}
+
+impl RobertCtx {
+    pub fn new(rgb: Rgb, ws2812: Ws2812<'static, PIO0, 0, 1>) -> Self {
+        Self {
+            rgb,
+            ws2812,
+            enable_gamma: true,
+            brightness: 64,
+        }
+    }
 }
 
 pub struct RobertAlloc {}
@@ -37,6 +50,42 @@ impl DropDict for RobertAlloc {
 const RED: i32 = 100;
 const GREEN: i32 = 101;
 const BLUE: i32 = 102;
+
+fn rgb_to_i32(rgb: RGB8) -> i32 {
+    let (red, green, blue): (u8, u8, u8) = rgb.into();
+    let val = [blue, green, red, 0];
+    i32::from_le_bytes(val)
+}
+
+fn i32_to_rgb(val: i32) -> RGB8 {
+    let [blue, green, red, _] = val.to_le_bytes();
+    (red, green, blue).into()
+}
+
+fn vals_to_rgb(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let rgb: RGB8 = unsafe {
+        let blue = forth.data_stack.try_pop()?.data as u8;
+        let green = forth.data_stack.try_pop()?.data as u8;
+        let red = forth.data_stack.try_pop()?.data as u8;
+        (red, green, blue).into()
+    };
+    let val = rgb_to_i32(rgb);
+    forth.data_stack.push(Word::data(val))?;
+
+    Ok(())
+}
+
+fn set_gamma(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let val = unsafe { forth.data_stack.try_pop()?.data };
+    forth.host_ctxt.enable_gamma = val != 0;
+    Ok(())
+}
+
+fn set_brightness(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let val = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    forth.host_ctxt.brightness = val;
+    Ok(())
+}
 
 fn red_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     forth.data_stack.push(Word::data(RED))?;
@@ -83,9 +132,8 @@ fn conv_wheel(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     let val = forth.data_stack.try_pop()?;
     let val = unsafe { val.data } as u8;
     let val = wheel(val);
-    let (red, green, blue): (u8, u8, u8) = val.into();
-    let val = [0, red, green, blue];
-    forth.data_stack.push(Word::data(i32::from_le_bytes(val)))?;
+    let val = rgb_to_i32(val);
+    forth.data_stack.push(Word::data(val))?;
     Ok(())
 }
 
@@ -101,6 +149,7 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
         async_builtin!("reboot"),
         async_builtin!("flush"),
         async_builtin!("set_smartled"),
+        async_builtin!("smartled_off"),
     ];
 
     fn dispatch_async(
@@ -135,9 +184,20 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                 "set_smartled" => {
                     let val = forth.data_stack.try_pop()?;
                     let val = unsafe { val.data };
-                    let [_, r, g, b] = val.to_le_bytes();
-                    let data = RGB8 { r, g, b };
+                    let mut data = i32_to_rgb(val);
+
+                    if forth.host_ctxt.enable_gamma {
+                        data = gamma_one(data);
+                    }
+
+                    data = brightness_one(data, forth.host_ctxt.brightness);
+
+
                     forth.host_ctxt.ws2812.write(&[data]).await;
+                    Ok(())
+                }
+                "smartled_off" => {
+                    forth.host_ctxt.ws2812.write(&[colors::BLACK]).await;
                     Ok(())
                 }
                 _ => Err(forth3::Error::WordNotInDict),
@@ -298,6 +358,9 @@ pub const ROBERT_BUILTINS: &[BuiltinEntry<RobertCtx>] = &[
     builtin!("green", green_const),
     builtin!("blue", blue_const),
     builtin!("wheel", conv_wheel),
+    builtin!("rgb", vals_to_rgb),
+    builtin!("set_gamma", set_gamma),
+    builtin!("set_brightness", set_brightness),
     //
     // Math operations
     //
