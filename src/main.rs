@@ -17,8 +17,8 @@ use embassy_rp::{
     bind_interrupts,
     gpio::{AnyPin, Input, Level, Output, Pull},
     peripherals::USB,
-    pio::Pio,
     pwm,
+    spi::{Config as SpiConfig, Spi},
     usb::{Driver, Instance, InterruptHandler},
 };
 use embassy_usb::{
@@ -27,25 +27,23 @@ use embassy_usb::{
     Builder, Config,
 };
 use forth::{RobertCtx, INPIPE, OUTPIPE};
-use ws2812::Ws2812;
 
-use crate::{forth::run_forth, buzzer::Pwim};
+
+
+use crate::{forth::run_forth, lcd::LcdPins};
 use {defmt_rtt as _, panic_probe as _};
 mod buttons;
 mod buzzer;
 mod dial;
 mod forth;
+mod gc9a01a;
 mod ws2812;
+mod lcd;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
-pub struct Rgb {
-    pub r: Output<'static, AnyPin>,
-    pub g: Output<'static, AnyPin>,
-    pub b: Output<'static, AnyPin>,
-}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -89,46 +87,86 @@ async fn main(spawner: Spawner) {
         &mut control_buf,
     );
 
-    // Pins:
+    // PINS:
     //
-    // * IO25 - Blue
-    // * IO16 - Green
-    // * IO17 - Red
-    // * IO11 - NEO PWR
-    // * IO12 - NEO PIX
-    let red = Output::new(AnyPin::from(p.PIN_17), Level::High);
-    let blue = Output::new(AnyPin::from(p.PIN_25), Level::High);
-    let green = Output::new(AnyPin::from(p.PIN_16), Level::High);
-    let rgb = Rgb {
-        r: red,
-        g: green,
-        b: blue,
+    // * 00 - N/A
+    // * 01 - N/A
+    // * 02 - N/A
+    // * 03 - N/A
+    // * 04 - N/A
+    // * 05 - N/A
+    // * 06 - IMU/I2C SDA
+    // * 07 - IMU/I2C SCL
+    // * 08 - LCD D/C
+    // * 09 - LCD CSn
+    // * 10 - LCD CLK
+    // * 11 - LCD DIN
+    // * 12 - LCD Reset
+    // * 13 - N/A
+    // * 14 - N/A
+    // * 15 - N/A
+    // * 16 - N/A
+    // * 17 - N/A
+    // * 18 - N/A
+    // * 19 - N/A
+    // * 20 - N/A
+    // * 21 - N/A
+    // * 22 - N/A
+    // * 23 - IMU INT1
+    // * 24 - IMU INT2
+    // * 25 - LCD Backlight
+    // * 26 - N/A
+    // * 27 - N/A
+    // * 28 - N/A
+    // * 29 - Battery ADC
+    let mut spi_cfg = SpiConfig::default();
+    spi_cfg.frequency = 62_500_000;
+
+    let spi = Spi::new_txonly(p.SPI1, p.PIN_10, p.PIN_11, p.DMA_CH0, spi_cfg);
+
+    let bl = pwm::Pwm::new_output_b(p.PWM_CH4, p.PIN_25, pwm::Config::default());
+
+    let lcd = LcdPins {
+        spi,
+        dc: Output::new(AnyPin::from(p.PIN_8), Level::Low),
+        cs: Output::new(AnyPin::from(p.PIN_9), Level::High),
+        rst: Output::new(AnyPin::from(p.PIN_12), Level::High),
+        backlight: bl,
     };
 
-    let Pio {
-        mut common, sm0, ..
-    } = Pio::new(p.PIO0, ws2812::Irqs);
+    // let red = Output::new(AnyPin::from(p.PIN_13), Level::High);
+    // let blue = Output::new(AnyPin::from(p.PIN_25), Level::High);
+    // let green = Output::new(AnyPin::from(p.PIN_14), Level::High);
+    // let rgb = Rgb {
+    //     r: red,
+    //     g: green,
+    //     b: blue,
+    // };
+
+    // let Pio {
+    //     mut common, sm0, ..
+    // } = Pio::new(p.PIO0, ws2812::Irqs);
 
     // Common neopixel pins:
     // Thing plus: 8
     // Adafruit Feather: 16;  Adafruit Feather+RFM95: 4
-    let ws2812 = Ws2812::new(
-        &mut common,
-        sm0,
-        p.DMA_CH0,
-        p.PIN_12,
-        Output::new(AnyPin::from(p.PIN_11), Level::Low),
-    );
+    // let ws2812 = Ws2812::new(
+    //     &mut common,
+    //     sm0,
+    //     p.DMA_CH0,
+    //     p.PIN_12,
+    //     Output::new(AnyPin::from(p.PIN_15), Level::Low),
+    // );
 
     let adc = Adc::new(p.ADC, dial::Irqs, adc::Config::default());
-    let adc_pin = adc::Channel::new_pin(p.PIN_28, Pull::None);
+    let adc_pin = adc::Channel::new_pin(p.PIN_29, Pull::None);
 
-    let pw = Pwim {
-        pwm: pwm::Pwm::new_output_a(p.PWM_CH3, p.PIN_6, pwm::Config::default()),
-    };
+    // let pw = Pwim {
+    //     pwm: pwm::Pwm::new_output_a(p.PWM_CH3, p.PIN_6, pwm::Config::default()),
+    // };
 
     // spawner.spawn(blink(rgb)).unwrap();
-    spawner.spawn(run_forth(RobertCtx::new(rgb, ws2812 ))).unwrap();
+    spawner.spawn(run_forth(RobertCtx::new(lcd))).unwrap();
     spawner
         .spawn(buttons::butt(
             buttons::Buttons {
@@ -137,7 +175,7 @@ async fn main(spawner: Spawner) {
                 c: Input::new(AnyPin::from(p.PIN_2), Pull::Up),
                 d: Input::new(AnyPin::from(p.PIN_1), Pull::Up),
             },
-            pw,
+            // pw,
         ))
         .unwrap();
     spawner.spawn(dial::dial(adc, adc_pin)).unwrap();

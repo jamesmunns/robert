@@ -1,10 +1,11 @@
 use core::{
-    alloc::Layout, cell::UnsafeCell, future::Future, mem::MaybeUninit, ptr::NonNull, unreachable,
+    alloc::Layout, cell::UnsafeCell, fmt::Write, future::Future, mem::MaybeUninit, ptr::NonNull,
+    unreachable,
 };
 
-use embassy_rp::{rom_data, peripherals::PIO0};
+use embassy_rp::{peripherals::PIO0, rom_data};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, pipe::Pipe};
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 use forth3::{
     async_builtin, builtin,
     dictionary::{
@@ -17,24 +18,35 @@ use forth3::{
     word::Word,
     AsyncForth, Buffers, CallContext, Forth,
 };
-use smart_leds::{RGB8, colors};
+use smart_leds::{colors, RGB8};
 
-use crate::{Rgb, ws2812::{wheel, Ws2812, gamma_one, brightness_one}};
+use crate::{
+    gc9a01a::registers::{InitOp, GC9A01A_CASET, GC9A01A_PASET, GC9A01A_RAMWR, INIT_SEQ},
+    lcd::LcdBuf,
+    ws2812::{brightness_one, gamma_one, wheel, Ws2812},
+    LcdPins,
+};
+
+const FONT: Font = Font {
+    font: include_bytes!("../ProFont24Point.raw"),
+    font_width_chars: 32,
+    font_height_chars: 6,
+    char_width_px: 16,
+    char_height_px: 29,
+};
 
 pub struct RobertCtx {
-    pub rgb: Rgb,
-    pub ws2812: Ws2812<'static, PIO0, 0, 1>,
-    pub enable_gamma: bool,
-    pub brightness: u8,
+    pub has_init: bool,
+    pub lcd: LcdPins,
+    pub lcd_buf: LcdBuf,
 }
 
 impl RobertCtx {
-    pub fn new(rgb: Rgb, ws2812: Ws2812<'static, PIO0, 0, 1>) -> Self {
+    pub fn new(lcd: LcdPins) -> Self {
         Self {
-            rgb,
-            ws2812,
-            enable_gamma: true,
-            brightness: 64,
+            has_init: false,
+            lcd,
+            lcd_buf: LcdBuf::new(),
         }
     }
 }
@@ -46,10 +58,6 @@ impl DropDict for RobertAlloc {
         panic!()
     }
 }
-
-const RED: i32 = 100;
-const GREEN: i32 = 101;
-const BLUE: i32 = 102;
 
 fn rgb_to_i32(rgb: RGB8) -> i32 {
     let (red, green, blue): (u8, u8, u8) = rgb.into();
@@ -75,58 +83,335 @@ fn vals_to_rgb(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     Ok(())
 }
 
-fn set_gamma(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    let val = unsafe { forth.data_stack.try_pop()?.data };
-    forth.host_ctxt.enable_gamma = val != 0;
-    Ok(())
-}
+async fn blank_line(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let idx = unsafe { forth.data_stack.try_pop()?.data } as u8;
 
-fn set_brightness(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    let val = unsafe { forth.data_stack.try_pop()?.data } as u8;
-    forth.host_ctxt.brightness = val;
-    Ok(())
-}
+    let col = linecolor(idx);
+    let lcd = &mut forth.host_ctxt.lcd;
+    let lcd_buf = &mut forth.host_ctxt.lcd_buf;
+    let xrange = lcd_buf.get_x_range(idx);
+    let yrange = lcd_buf.get_y_range(idx);
 
-fn red_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    forth.data_stack.push(Word::data(RED))?;
-    Ok(())
-}
-
-fn green_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    forth.data_stack.push(Word::data(GREEN))?;
-    Ok(())
-}
-
-fn blue_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    forth.data_stack.push(Word::data(BLUE))?;
-    Ok(())
-}
-
-fn led_on(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    let val = forth.data_stack.try_pop()?;
-    let val = unsafe { val.data };
-    let led = match val {
-        RED => &mut forth.host_ctxt.rgb.r,
-        GREEN => &mut forth.host_ctxt.rgb.g,
-        BLUE => &mut forth.host_ctxt.rgb.b,
-        _ => return Err(forth3::Error::BadLiteral),
+    let (Some(color), Some((xs, xe)), Some((ys, ye))) = (col, xrange, yrange) else {
+        return Ok(());
     };
-    led.set_low();
+
+    rect_inner(lcd, xs, xe, ys, ye, color).await.ok();
+
     Ok(())
 }
 
-fn led_off(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
-    let val = forth.data_stack.try_pop()?;
-    let val = unsafe { val.data };
-    let led = match val {
-        RED => &mut forth.host_ctxt.rgb.r,
-        GREEN => &mut forth.host_ctxt.rgb.g,
-        BLUE => &mut forth.host_ctxt.rgb.b,
-        _ => return Err(forth3::Error::BadLiteral),
+async fn print_line(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let idx = unsafe { forth.data_stack.try_pop()?.data } as u8;
+
+    let col = linecolor(idx);
+    let lcd = &mut forth.host_ctxt.lcd;
+    let lcd_buf = &mut forth.host_ctxt.lcd_buf;
+    let xrange = lcd_buf.get_x_range(idx);
+    let yrange = lcd_buf.get_y_range(idx);
+    let txt_buf = lcd_buf.get_line(idx);
+
+    let (Some(color), Some((xs, xe)), Some((ys, ye)), Some(txt_buf)) =
+        (col, xrange, yrange, txt_buf)
+    else {
+        return Ok(());
     };
-    led.set_high();
+
+    // Blank the line
+    rect_inner(lcd, xs, xe, ys, ye, color).await.ok();
+    let txt = forth.output.as_str();
+
+    let txt = txt.trim();
+
+    if txt.is_empty() {
+        return Ok(());
+    }
+
+    let len = txt.len().min(txt_buf.len());
+
+    let txt = &txt[..len];
+
+    let mut buf = [0u8; 1024];
+    let buf = &mut buf[..FONT.char_buf_size()];
+
+    let lcd = &mut forth.host_ctxt.lcd;
+
+    // Figure out the starting X position centered
+    let txt_width = txt.len() * FONT.char_width_px;
+    let ttl_width = (xe - xs) as usize;
+    let delta_w = ttl_width - txt_width;
+    let half_delta_w = (delta_w / 2) as u8;
+    let xs = xs + half_delta_w;
+    let mut x_pos = xs;
+
+    for ch in txt.as_bytes() {
+        let idx = ch - b' ';
+        let ch_x = idx % 32;
+        let ch_y = idx / 32;
+
+        FONT.font_bit_to_be_bytes(buf, ch_x.into(), ch_y.into(), 0xFFFF, color)
+            .unwrap();
+
+        lcd.draw(x_pos, x_pos + 16, ys, ye, buf)
+            .await
+            .ok();
+
+        x_pos += 16;
+    }
+
+    forth.output.clear();
+
     Ok(())
 }
+
+fn linecolor(idx: u8) -> Option<u16> {
+    #[allow(clippy::unusual_byte_groupings)]
+    match idx {
+        0 => Some(0b00000_000000_10000),
+        1 => Some(0b00000_000000_01100),
+        2 => Some(0b00000_000000_01000),
+        3 => Some(0b00000_000000_00110),
+        4 => Some(0b00000_000000_01000),
+        5 => Some(0b00000_000000_01100),
+        6 => Some(0b00000_000000_10000),
+        _ => None,
+    }
+}
+
+fn set_backlight(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let data = unsafe { forth.data_stack.try_pop()?.data };
+    let data = data.max(0).min(u16::MAX.into());
+    let data = data as u16;
+
+    let mut config = embassy_rp::pwm::Config::default();
+    config.top = u16::MAX;
+    config.compare_b = data;
+    config.enable = true;
+
+    forth.host_ctxt.lcd.backlight.set_config(&config);
+
+    Ok(())
+}
+
+async fn init_disp(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    if forth.host_ctxt.has_init {
+        return Ok(());
+    }
+    forth.host_ctxt.has_init = true;
+
+    let lcd = &mut forth.host_ctxt.lcd;
+
+    for c in INIT_SEQ {
+        match c {
+            InitOp::Cmd(c) => {
+                // command
+                lcd.command(&[c.cmd]).await.ok();
+                Timer::after(Duration::from_micros(10)).await;
+
+                // data
+                lcd.data(c.data).await.ok();
+                Timer::after(Duration::from_micros(10)).await;
+            }
+            InitOp::Delay(ms) => {
+                Timer::after(Duration::from_millis(ms.into())).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn rect_inner(
+    lcd: &mut LcdPins,
+    xs: u8,
+    xe: u8,
+    ys: u8,
+    ye: u8,
+    color: u16,
+) -> Result<(), ()> {
+    if (ye <= ys) || (xe <= xs) {
+        return Ok(());
+    }
+
+    lcd.command(&[GC9A01A_CASET]).await.ok();
+    lcd.data(&[0x00, xs, 0x00, xe - 1]).await.ok();
+    lcd.command(&[GC9A01A_PASET]).await.ok();
+    lcd.data(&[0x00, ys, 0x00, ye - 1]).await.ok();
+    lcd.command(&[GC9A01A_RAMWR]).await.ok();
+
+    let mut buf = [0u8; 4096];
+    let color = color.to_be_bytes();
+
+    buf.chunks_exact_mut(2)
+        .for_each(|b| b.copy_from_slice(&color));
+
+    let mut remaining = (ye as usize - ys as usize) * (xe as usize - xs as usize) * 2;
+
+    lcd.cs.set_low();
+    lcd.dc.set_high();
+
+    while remaining != 0 {
+        let take = remaining.min(4096);
+        remaining -= take;
+        lcd.spi.write(&buf[..take]).await.ok();
+    }
+
+    lcd.cs.set_high();
+
+    Ok(())
+}
+
+// xs xe ys ye rgb rect
+async fn rect(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let rgb = unsafe { forth.data_stack.try_pop()?.data } as u16;
+    let ye = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    let ys = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    let xe = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    let xs = unsafe { forth.data_stack.try_pop()?.data } as u8;
+
+    let lcd = &mut forth.host_ctxt.lcd;
+
+    rect_inner(lcd, xs, xe, ys, ye, rgb).await.ok();
+    Ok(())
+}
+
+struct Font<'a> {
+    font: &'a [u8],
+    font_width_chars: usize,
+    font_height_chars: usize,
+    char_width_px: usize,
+    char_height_px: usize,
+}
+
+impl<'a> Font<'a> {
+    fn char_buf_size(&self) -> usize {
+        self.char_width_px * self.char_height_px * core::mem::size_of::<u16>()
+    }
+
+    fn font_bin_size(&self) -> usize {
+        let char_ttl_px = self.char_width_px * self.char_height_px;
+        char_ttl_px * self.font_width_chars * self.font_height_chars / 8
+    }
+
+    fn font_bit_to_be_bytes(
+        &self,
+        buf: &mut [u8],
+        char_x: usize,
+        char_y: usize,
+        set_val: u16,
+        clr_val: u16,
+    ) -> Result<(), ()> {
+        if buf.len() != self.char_buf_size() {
+            return Err(());
+        }
+        if self.font.len() != self.font_bin_size() {
+            return Err(());
+        }
+
+        let row_width_bytes = (self.char_width_px * self.font_width_chars) / 8;
+
+        let onechar = buf.chunks_mut(self.char_width_px * 2);
+        let rows = self.font.chunks_exact(row_width_bytes);
+        let relevant = rows
+            .skip(self.char_height_px * char_y)
+            .take(self.char_height_px);
+        onechar.zip(relevant).for_each(|(by, bi)| {
+            by.chunks_exact_mut(16)
+                .zip(bi.iter().skip(2 * char_x).take(2))
+                .for_each(|(by16, bi)| {
+                    let mut val = *bi;
+                    for by in by16.chunks_exact_mut(2) {
+                        let contents = if val & 0x80 != 0 { set_val } else { clr_val };
+                        by.copy_from_slice(&contents.to_be_bytes());
+                        val <<= 1;
+                    }
+                })
+        });
+
+        Ok(())
+    }
+}
+
+// x y font
+async fn font(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let y_pos = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    let mut x_pos = unsafe { forth.data_stack.try_pop()?.data } as u8;
+
+    let mut buf = [0u8; 1024];
+    let buf = &mut buf[..FONT.char_buf_size()];
+
+    let lcd = &mut forth.host_ctxt.lcd;
+
+    for ch in b"butts" {
+        let idx = ch - b' ';
+        let ch_x = idx % 32;
+        let ch_y = idx / 32;
+
+        FONT.font_bit_to_be_bytes(buf, ch_x.into(), ch_y.into(), 0xFFFF, 0x0000)
+            .unwrap();
+
+        lcd.draw(x_pos, x_pos + 16, y_pos, y_pos + 29, buf)
+            .await
+            .ok();
+
+        x_pos += 16;
+    }
+
+    Ok(())
+}
+
+// fn set_gamma(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     let val = unsafe { forth.data_stack.try_pop()?.data };
+//     forth.host_ctxt.enable_gamma = val != 0;
+//     Ok(())
+// }
+
+// fn set_brightness(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     let val = unsafe { forth.data_stack.try_pop()?.data } as u8;
+//     forth.host_ctxt.brightness = val;
+//     Ok(())
+// }
+
+// fn red_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     forth.data_stack.push(Word::data(RED))?;
+//     Ok(())
+// }
+
+// fn green_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     forth.data_stack.push(Word::data(GREEN))?;
+//     Ok(())
+// }
+
+// fn blue_const(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     forth.data_stack.push(Word::data(BLUE))?;
+//     Ok(())
+// }
+
+// fn led_on(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     let val = forth.data_stack.try_pop()?;
+//     let val = unsafe { val.data };
+//     let led = match val {
+//         RED => &mut forth.host_ctxt.rgb.r,
+//         GREEN => &mut forth.host_ctxt.rgb.g,
+//         BLUE => &mut forth.host_ctxt.rgb.b,
+//         _ => return Err(forth3::Error::BadLiteral),
+//     };
+//     led.set_low();
+//     Ok(())
+// }
+
+// fn led_off(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+//     let val = forth.data_stack.try_pop()?;
+//     let val = unsafe { val.data };
+//     let led = match val {
+//         RED => &mut forth.host_ctxt.rgb.r,
+//         GREEN => &mut forth.host_ctxt.rgb.g,
+//         BLUE => &mut forth.host_ctxt.rgb.b,
+//         _ => return Err(forth3::Error::BadLiteral),
+//     };
+//     led.set_high();
+//     Ok(())
+// }
 
 fn conv_wheel(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     let val = forth.data_stack.try_pop()?;
@@ -136,7 +421,6 @@ fn conv_wheel(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     forth.data_stack.push(Word::data(val))?;
     Ok(())
 }
-
 
 pub struct RobertAsync {}
 
@@ -148,8 +432,13 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
         async_builtin!("sleep::ms"),
         async_builtin!("reboot"),
         async_builtin!("flush"),
-        async_builtin!("set_smartled"),
-        async_builtin!("smartled_off"),
+        // async_builtin!("set_smartled"),
+        // async_builtin!("smartled_off"),
+        async_builtin!("init_lcd"),
+        async_builtin!("rect"),
+        async_builtin!("font"),
+        async_builtin!("blank_line"),
+        async_builtin!("print_line"),
     ];
 
     fn dispatch_async(
@@ -166,7 +455,8 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                 }
                 "sleep::ms" => {
                     let secs = unsafe { forth.data_stack.try_pop()?.data };
-                    embassy_time::Timer::after(Duration::from_millis(secs.try_into().unwrap())).await;
+                    embassy_time::Timer::after(Duration::from_millis(secs.try_into().unwrap()))
+                        .await;
                     Ok(())
                 }
                 "reboot" => {
@@ -181,25 +471,29 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                     forth.output.clear();
                     Ok(())
                 }
-                "set_smartled" => {
-                    let val = forth.data_stack.try_pop()?;
-                    let val = unsafe { val.data };
-                    let mut data = i32_to_rgb(val);
+                "init_lcd" => init_disp(forth).await,
+                "rect" => rect(forth).await,
+                "font" => font(forth).await,
+                "blank_line" => blank_line(forth).await,
+                "print_line" => print_line(forth).await,
+                // "set_smartled" => {
+                //     let val = forth.data_stack.try_pop()?;
+                //     let val = unsafe { val.data };
+                //     let mut data = i32_to_rgb(val);
 
-                    if forth.host_ctxt.enable_gamma {
-                        data = gamma_one(data);
-                    }
+                //     if forth.host_ctxt.enable_gamma {
+                //         data = gamma_one(data);
+                //     }
 
-                    data = brightness_one(data, forth.host_ctxt.brightness);
+                //     data = brightness_one(data, forth.host_ctxt.brightness);
 
-
-                    forth.host_ctxt.ws2812.write(&[data]).await;
-                    Ok(())
-                }
-                "smartled_off" => {
-                    forth.host_ctxt.ws2812.write(&[colors::BLACK]).await;
-                    Ok(())
-                }
+                //     forth.host_ctxt.ws2812.write(&[data]).await;
+                //     Ok(())
+                // }
+                // "smartled_off" => {
+                //     forth.host_ctxt.ws2812.write(&[colors::BLACK]).await;
+                //     Ok(())
+                // }
                 _ => Err(forth3::Error::WordNotInDict),
             }
         }
@@ -352,15 +646,16 @@ pub async fn run_forth(ctx: RobertCtx) {
 
 pub const ROBERT_BUILTINS: &[BuiltinEntry<RobertCtx>] = &[
     // Custom operations
-    builtin!("on", led_on),
-    builtin!("off", led_off),
-    builtin!("red", red_const),
-    builtin!("green", green_const),
-    builtin!("blue", blue_const),
+    // builtin!("on", led_on),
+    // builtin!("off", led_off),
+    // builtin!("red", red_const),
+    // builtin!("green", green_const),
+    // builtin!("blue", blue_const),
     builtin!("wheel", conv_wheel),
     builtin!("rgb", vals_to_rgb),
-    builtin!("set_gamma", set_gamma),
-    builtin!("set_brightness", set_brightness),
+    // builtin!("set_gamma", set_gamma),
+    // builtin!("set_brightness", set_brightness),
+    builtin!("set_backlight", set_backlight),
     //
     // Math operations
     //

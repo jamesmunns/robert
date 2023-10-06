@@ -24,22 +24,25 @@ impl Buttons {
 
 
 #[embassy_executor::task]
-pub async fn butt(btn: Buttons, mut p: Pwim) {
+pub async fn butt(
+    btn: Buttons,
+    // mut p: Pwim
+) {
     let mut state = btn.read_all();
     loop {
         let new_state = btn.read_all();
         if new_state != state {
-            if new_state[0] {
-                let mut c: pwm::Config = Default::default();
-                c.top = 0x8000;
-                c.compare_a = 0x4000;
-                p.pwm.set_config(&c);
-            } else {
-                let mut c: pwm::Config = Default::default();
-                c.top = 0x8000;
-                c.compare_a = 0;
-                p.pwm.set_config(&c);
-            }
+            // if new_state[0] {
+            //     let mut c: pwm::Config = Default::default();
+            //     c.top = 0x8000;
+            //     c.compare_a = 0x4000;
+            //     p.pwm.set_config(&c);
+            // } else {
+            //     let mut c: pwm::Config = Default::default();
+            //     c.top = 0x8000;
+            //     c.compare_a = 0;
+            //     p.pwm.set_config(&c);
+            // }
             OUTPIPE.write_all(b"\r\n").await;
             for b in new_state.iter().copied() {
                 OUTPIPE.write_all(if b {
