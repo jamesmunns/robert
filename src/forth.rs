@@ -3,7 +3,7 @@ use core::{
     unreachable,
 };
 
-use embassy_rp::{peripherals::PIO0, rom_data};
+use embassy_rp::rom_data;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, pipe::Pipe};
 use embassy_time::{Duration, Timer};
 use forth3::{
@@ -23,7 +23,7 @@ use smart_leds::{colors, RGB8};
 use crate::{
     gc9a01a::registers::{InitOp, GC9A01A_CASET, GC9A01A_PASET, GC9A01A_RAMWR, INIT_SEQ},
     lcd::LcdBuf,
-    ws2812::{brightness_one, gamma_one, wheel, Ws2812},
+    ws2812::wheel,
     LcdPins,
 };
 
@@ -33,6 +33,14 @@ const FONT: Font = Font {
     font_height_chars: 6,
     char_width_px: 16,
     char_height_px: 29,
+};
+
+const FONT2: Font = Font {
+    font: include_bytes!("../assets/source-code-pro-ascii.aff"),
+    font_width_chars: 32,
+    font_height_chars: 3,
+    char_width_px: 14,
+    char_height_px: 31,
 };
 
 pub struct RobertCtx {
@@ -80,6 +88,20 @@ fn vals_to_rgb(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     let val = rgb_to_i32(rgb);
     forth.data_stack.push(Word::data(val))?;
 
+    Ok(())
+}
+
+async fn init(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    init_disp(forth).await?;
+    forth.data_stack.push(Word::data(32768))?;
+    forth.data_stack.push(Word::data(0))?;
+    forth.data_stack.push(Word::data(240))?;
+    forth.data_stack.push(Word::data(0))?;
+    forth.data_stack.push(Word::data(240))?;
+    forth.data_stack.push(Word::data(0))?;
+    rect(forth).await?;
+    Timer::after(Duration::from_millis(50)).await;
+    set_backlight(forth)?;
     Ok(())
 }
 
@@ -132,12 +154,10 @@ async fn print_line(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     let txt = &txt[..len];
 
     let mut buf = [0u8; 1024];
-    let buf = &mut buf[..FONT.char_buf_size()];
-
-    let lcd = &mut forth.host_ctxt.lcd;
+    let buf = &mut buf[..FONT2.char_buf_size()];
 
     // Figure out the starting X position centered
-    let txt_width = txt.len() * FONT.char_width_px;
+    let txt_width = txt.len() * FONT2.char_width_px;
     let ttl_width = (xe - xs) as usize;
     let delta_w = ttl_width - txt_width;
     let half_delta_w = (delta_w / 2) as u8;
@@ -149,14 +169,28 @@ async fn print_line(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
         let ch_x = idx % 32;
         let ch_y = idx / 32;
 
-        FONT.font_bit_to_be_bytes(buf, ch_x.into(), ch_y.into(), 0xFFFF, color)
+        let rgb = {
+            let r = ((color >> 8) & 0b11111000) as u8;
+            let g = ((color >> 2) & 0b11111100) as u8;
+            let b = ((color << 3) & 0b11111000) as u8;
+            (r, g, b)
+        };
+
+        FONT2
+            .font_alpha_to_be_bytes(buf, ch_x.into(), ch_y.into(), colors::WHITE, rgb.into())
             .unwrap();
 
-        lcd.draw(x_pos, x_pos + 16, ys, ye, buf)
-            .await
-            .ok();
+        lcd.draw(
+            x_pos,
+            x_pos + FONT2.char_width_px as u8,
+            ys,
+            ys + FONT2.char_height_px as u8,
+            buf,
+        )
+        .await
+        .ok();
 
-        x_pos += 16;
+        x_pos += FONT2.char_width_px as u8;
     }
 
     forth.output.clear();
@@ -293,6 +327,74 @@ impl<'a> Font<'a> {
         char_ttl_px * self.font_width_chars * self.font_height_chars / 8
     }
 
+    fn font_alpha_to_be_bytes(
+        &self,
+        buf: &mut [u8],
+        char_x: usize,
+        char_y: usize,
+        set_val: RGB8,
+        clr_val: RGB8,
+    ) -> Result<(), ()> {
+        // Break apart colors
+        let (sr, sg, sb): (u8, u8, u8) = set_val.into();
+        let (cr, cg, cb): (u8, u8, u8) = clr_val.into();
+
+        // How many pixels wide is the source font table?
+        let font_width_px = self.char_width_px * self.font_width_chars;
+
+        // One row at a time of the destination (in 16-bit 565 values)
+        let dst_rows = buf.chunks_exact_mut(self.char_width_px * 2);
+
+        // This is an iterator of all font rows
+        let rows = self.font.chunks_exact(font_width_px);
+
+        // This is only the font rows that are relevant to the character we want
+        let relevant = rows
+            .skip(self.char_height_px * char_y)
+            .take(self.char_height_px);
+
+        // For each destination row zipped with each font source row...
+        dst_rows
+            .zip(relevant)
+            .flat_map(|(dst_row, src_row)| {
+                // ... We only want the columns in each font row that are relevant
+                // for this character...
+                let cols = src_row
+                    .iter()
+                    .skip(char_x * self.char_width_px)
+                    .take(self.char_width_px);
+
+                // Then for each dest 16-bit value, apply the 1-byte alpha
+                dst_row.chunks_exact_mut(2).zip(cols)
+            })
+            .for_each(|(dst_2b, alpha_1b)| {
+                // Here "plus" is how much we take from the "set" color,
+                // and "minus" is how much we take from the "clear" color.
+                //
+                // This is to fade the transparency to the background color
+                let plus = *alpha_1b as u16;
+                let minus = 255 - plus;
+
+                // Apply alpha to each channel, extending it to 16 bits for each
+                // channel (8b x 8b = 16b)
+                let r0 = sr as u16 * plus;
+                let r1 = cr as u16 * minus;
+                let g0 = sg as u16 * plus;
+                let g1 = cg as u16 * minus;
+                let b0 = sb as u16 * plus;
+                let b1 = cb as u16 * minus;
+
+                // Then add the two halves together, and convert to 565 format
+                let r = (r0 + r1) & 0b1111100000000000;
+                let g = ((g0 + g1) & 0b1111110000000000) >> 5;
+                let b = ((b0 + b1) & 0b1111100000000000) >> 11;
+
+                // Then write to the dest buffer
+                dst_2b.copy_from_slice(&(r + g + b).to_be_bytes());
+            });
+        Ok(())
+    }
+
     fn font_bit_to_be_bytes(
         &self,
         buf: &mut [u8],
@@ -310,23 +412,22 @@ impl<'a> Font<'a> {
 
         let row_width_bytes = (self.char_width_px * self.font_width_chars) / 8;
 
-        let onechar = buf.chunks_mut(self.char_width_px * 2);
-        let rows = self.font.chunks_exact(row_width_bytes);
-        let relevant = rows
+        buf.chunks_mut(self.char_width_px * 2)
+            .zip(self.font.chunks_exact(row_width_bytes))
             .skip(self.char_height_px * char_y)
-            .take(self.char_height_px);
-        onechar.zip(relevant).for_each(|(by, bi)| {
-            by.chunks_exact_mut(16)
-                .zip(bi.iter().skip(2 * char_x).take(2))
-                .for_each(|(by16, bi)| {
-                    let mut val = *bi;
-                    for by in by16.chunks_exact_mut(2) {
-                        let contents = if val & 0x80 != 0 { set_val } else { clr_val };
-                        by.copy_from_slice(&contents.to_be_bytes());
-                        val <<= 1;
-                    }
-                })
-        });
+            .take(self.char_height_px)
+            .flat_map(|(by, bi)| {
+                by.chunks_exact_mut(16)
+                    .zip(bi.iter().skip(2 * char_x).take(2))
+            })
+            .for_each(|(by16, bi)| {
+                let mut val = *bi;
+                for by in by16.chunks_exact_mut(2) {
+                    let contents = if val & 0x80 != 0 { set_val } else { clr_val };
+                    by.copy_from_slice(&contents.to_be_bytes());
+                    val <<= 1;
+                }
+            });
 
         Ok(())
     }
@@ -355,6 +456,40 @@ async fn font(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
             .ok();
 
         x_pos += 16;
+    }
+
+    Ok(())
+}
+
+async fn font2(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let y_pos = unsafe { forth.data_stack.try_pop()?.data } as u8;
+    let mut x_pos = unsafe { forth.data_stack.try_pop()?.data } as u8;
+
+    let mut buf = [0u8; 1024];
+    let buf = &mut buf[..FONT2.char_buf_size()];
+
+    let lcd = &mut forth.host_ctxt.lcd;
+
+    for ch in b"butts" {
+        let idx = ch - b' ';
+        let ch_x = idx % 32;
+        let ch_y = idx / 32;
+
+        FONT2
+            .font_alpha_to_be_bytes(buf, ch_x.into(), ch_y.into(), colors::WHITE, colors::BLACK)
+            .unwrap();
+
+        lcd.draw(
+            x_pos,
+            x_pos + FONT2.char_width_px as u8,
+            y_pos,
+            y_pos + FONT2.char_height_px as u8,
+            buf,
+        )
+        .await
+        .ok();
+
+        x_pos += FONT2.char_width_px as u8;
     }
 
     Ok(())
@@ -434,9 +569,11 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
         async_builtin!("flush"),
         // async_builtin!("set_smartled"),
         // async_builtin!("smartled_off"),
+        async_builtin!("init"),
         async_builtin!("init_lcd"),
         async_builtin!("rect"),
         async_builtin!("font"),
+        async_builtin!("font2"),
         async_builtin!("blank_line"),
         async_builtin!("print_line"),
     ];
@@ -474,8 +611,10 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                 "init_lcd" => init_disp(forth).await,
                 "rect" => rect(forth).await,
                 "font" => font(forth).await,
+                "font2" => font2(forth).await,
                 "blank_line" => blank_line(forth).await,
                 "print_line" => print_line(forth).await,
+                "init" => init(forth).await,
                 // "set_smartled" => {
                 //     let val = forth.data_stack.try_pop()?;
                 //     let val = unsafe { val.data };

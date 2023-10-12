@@ -39,6 +39,7 @@ mod forth;
 mod gc9a01a;
 mod ws2812;
 mod lcd;
+mod fmath;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
