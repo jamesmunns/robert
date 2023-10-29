@@ -9,15 +9,19 @@ pub struct Buttons {
     pub b: Input<'static, AnyPin>,
     pub c: Input<'static, AnyPin>,
     pub d: Input<'static, AnyPin>,
+    pub e: Input<'static, AnyPin>,
+    pub f: Input<'static, AnyPin>,
 }
 
 impl Buttons {
-    pub fn read_all(&self) -> [bool; 4] {
+    pub fn read_all(&self) -> [bool; 6] {
         [
             self.a.is_low(),
             self.b.is_low(),
             self.c.is_low(),
             self.d.is_low(),
+            self.e.is_low(),
+            self.f.is_low(),
         ]
     }
 }

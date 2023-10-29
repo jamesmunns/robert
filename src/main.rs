@@ -16,7 +16,7 @@ use embassy_rp::{
     adc::{self, Adc},
     bind_interrupts,
     gpio::{AnyPin, Input, Level, Output, Pull},
-    peripherals::USB,
+    peripherals::{USB, PWM_CH3, PWM_CH5, PWM_CH0, PWM_CH7},
     pwm,
     spi::{Config as SpiConfig, Spi},
     usb::{Driver, Instance, InterruptHandler},
@@ -30,7 +30,7 @@ use forth::{RobertCtx, INPIPE, OUTPIPE};
 
 
 
-use crate::{forth::run_forth, lcd::LcdPins};
+use crate::{forth::run_forth, lcd::LcdPins, leds::Leds, spiflash::SpiFlash};
 use {defmt_rtt as _, panic_probe as _};
 mod buttons;
 mod buzzer;
@@ -40,6 +40,8 @@ mod gc9a01a;
 mod ws2812;
 mod lcd;
 mod fmath;
+mod leds;
+mod spiflash;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -90,36 +92,36 @@ async fn main(spawner: Spawner) {
 
     // PINS:
     //
-    // * 00 - N/A
-    // * 01 - N/A
+    // * 00 - (EXT) LED3 - PWM0A
+    // * 01 - (EXT) SW1
     // * 02 - N/A
     // * 03 - N/A
-    // * 04 - N/A
-    // * 05 - N/A
-    // * 06 - IMU/I2C SDA
-    // * 07 - IMU/I2C SCL
-    // * 08 - LCD D/C
-    // * 09 - LCD CSn
-    // * 10 - LCD CLK
-    // * 11 - LCD DIN
-    // * 12 - LCD Reset
-    // * 13 - N/A
-    // * 14 - N/A
-    // * 15 - N/A
-    // * 16 - N/A
-    // * 17 - N/A
-    // * 18 - N/A
-    // * 19 - N/A
-    // * 20 - N/A
-    // * 21 - N/A
-    // * 22 - N/A
-    // * 23 - IMU INT1
-    // * 24 - IMU INT2
-    // * 25 - LCD Backlight
-    // * 26 - N/A
-    // * 27 - N/A
-    // * 28 - N/A
-    // * 29 - Battery ADC
+    // * 04 - (EXT) SPI0 IO3
+    // * 05 - (EXT) SPI0 IO2
+    // * 06 - (BRD) IMU/I2C SDA
+    // * 07 - (BRD) IMU/I2C SCL
+    // * 08 - (BRD) LCD D/C
+    // * 09 - (BRD) LCD CSn
+    // * 10 - (BRD) LCD CLK
+    // * 11 - (BRD) LCD DIN
+    // * 12 - (BRD) LCD Reset
+    // * 13 - (EXT) SW2
+    // * 14 - (EXT) LED4 - PWM7A
+    // * 15 - (EXT) SW3
+    // * 16 - (EXT) SPI0 RX
+    // * 17 - (EXT) SPI0 CSn
+    // * 18 - (EXT) SPI0 SCK
+    // * 19 - (EXT) SPI0 TX
+    // * 20 - (EXT) /!\ SPI0 PWR /!\
+    // * 21 - (EXT) SW6
+    // * 22 - (EXT) LED1 - PWM3A
+    // * 23 - (BRD) IMU INT1
+    // * 24 - (BRD) IMU INT2
+    // * 25 - (BRD) LCD Backlight
+    // * 26 - (EXT) SW4
+    // * 27 - (EXT) LED2 - PWM5B
+    // * 28 - (EXT) SW5
+    // * 29 - (BRD) Battery ADC
     let mut spi_cfg = SpiConfig::default();
     spi_cfg.frequency = 62_500_000;
 
@@ -135,46 +137,62 @@ async fn main(spawner: Spawner) {
         backlight: bl,
     };
 
-    // let red = Output::new(AnyPin::from(p.PIN_13), Level::High);
-    // let blue = Output::new(AnyPin::from(p.PIN_25), Level::High);
-    // let green = Output::new(AnyPin::from(p.PIN_14), Level::High);
-    // let rgb = Rgb {
-    //     r: red,
-    //     g: green,
-    //     b: blue,
-    // };
-
-    // let Pio {
-    //     mut common, sm0, ..
-    // } = Pio::new(p.PIO0, ws2812::Irqs);
-
-    // Common neopixel pins:
-    // Thing plus: 8
-    // Adafruit Feather: 16;  Adafruit Feather+RFM95: 4
-    // let ws2812 = Ws2812::new(
-    //     &mut common,
-    //     sm0,
-    //     p.DMA_CH0,
-    //     p.PIN_12,
-    //     Output::new(AnyPin::from(p.PIN_15), Level::Low),
-    // );
+    // * 22 - (EXT) LED1 - PWM3A
+    // * 27 - (EXT) LED2 - PWM5B
+    // * 00 - (EXT) LED3 - PWM0A
+    // * 14 - (EXT) LED4 - PWM7A
+    let led_1: pwm::Pwm<'static, PWM_CH3> = pwm::Pwm::new_output_a(p.PWM_CH3, p.PIN_22, pwm::Config::default());
+    let led_2: pwm::Pwm<'static, PWM_CH5> = pwm::Pwm::new_output_b(p.PWM_CH5, p.PIN_27, pwm::Config::default());
+    let led_3: pwm::Pwm<'static, PWM_CH0> = pwm::Pwm::new_output_a(p.PWM_CH0, p.PIN_0, pwm::Config::default());
+    let led_4: pwm::Pwm<'static, PWM_CH7> = pwm::Pwm::new_output_a(p.PWM_CH7, p.PIN_14, pwm::Config::default());
+    let leds = Leds { led_1, led_2, led_3, led_4 };
 
     let adc = Adc::new(p.ADC, dial::Irqs, adc::Config::default());
     let adc_pin = adc::Channel::new_pin(p.PIN_29, Pull::None);
 
-    // let pw = Pwim {
-    //     pwm: pwm::Pwm::new_output_a(p.PWM_CH3, p.PIN_6, pwm::Config::default()),
-    // };
+    // * 04 - (EXT) SPI0 IO3
+    // * 05 - (EXT) SPI0 IO2
+    // * 16 - (EXT) SPI0 RX
+    // * 17 - (EXT) SPI0 CSn
+    // * 18 - (EXT) SPI0 SCK
+    // * 19 - (EXT) SPI0 TX
+    // * 20 - (EXT) SPI0 PWR
+    let mut spif_cfg = SpiConfig::default();
+    spif_cfg.frequency = 16_000_000;
+    let spi = Spi::new(
+        p.SPI0,    // Periph
+        p.PIN_18,  // SCK
+        p.PIN_19,  // MOSI
+        p.PIN_16,  // MISO
+        p.DMA_CH1, // TX DMA
+        p.DMA_CH2, // RX DMA
+        spif_cfg,
+    );
+
+    let spif = SpiFlash {
+        spi,
+        csn: Output::new(AnyPin::from(p.PIN_17), Level::High),
+        io2: Input::new(AnyPin::from(p.PIN_5), Pull::None),
+        io3: Input::new(AnyPin::from(p.PIN_4), Pull::None),
+    };
 
     // spawner.spawn(blink(rgb)).unwrap();
-    spawner.spawn(run_forth(RobertCtx::new(lcd))).unwrap();
+    // * 01 - (EXT) SW1
+    // * 13 - (EXT) SW2
+    // * 15 - (EXT) SW3
+    // * 26 - (EXT) SW4
+    // * 28 - (EXT) SW5
+    // * 21 - (EXT) SW6
+    spawner.spawn(run_forth(RobertCtx::new(lcd, leds, spif))).unwrap();
     spawner
         .spawn(buttons::butt(
             buttons::Buttons {
-                a: Input::new(AnyPin::from(p.PIN_3), Pull::Up),
-                b: Input::new(AnyPin::from(p.PIN_4), Pull::Up),
-                c: Input::new(AnyPin::from(p.PIN_2), Pull::Up),
-                d: Input::new(AnyPin::from(p.PIN_1), Pull::Up),
+                a: Input::new(AnyPin::from(p.PIN_1), Pull::Up),
+                b: Input::new(AnyPin::from(p.PIN_13), Pull::Up),
+                c: Input::new(AnyPin::from(p.PIN_15), Pull::Up),
+                d: Input::new(AnyPin::from(p.PIN_26), Pull::Up),
+                e: Input::new(AnyPin::from(p.PIN_28), Pull::Up),
+                f: Input::new(AnyPin::from(p.PIN_21), Pull::Up),
             },
             // pw,
         ))

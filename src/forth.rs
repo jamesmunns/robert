@@ -23,8 +23,9 @@ use smart_leds::{colors, RGB8};
 use crate::{
     gc9a01a::registers::{InitOp, GC9A01A_CASET, GC9A01A_PASET, GC9A01A_RAMWR, INIT_SEQ},
     lcd::LcdBuf,
+    leds::Leds,
     ws2812::wheel,
-    LcdPins,
+    LcdPins, spiflash::SpiFlash,
 };
 
 const FONT: Font = Font {
@@ -47,14 +48,18 @@ pub struct RobertCtx {
     pub has_init: bool,
     pub lcd: LcdPins,
     pub lcd_buf: LcdBuf,
+    pub leds: Leds,
+    pub spif: SpiFlash,
 }
 
 impl RobertCtx {
-    pub fn new(lcd: LcdPins) -> Self {
+    pub fn new(lcd: LcdPins, leds: Leds, spif: SpiFlash) -> Self {
         Self {
             has_init: false,
             lcd,
             lcd_buf: LcdBuf::new(),
+            leds,
+            spif,
         }
     }
 }
@@ -104,6 +109,14 @@ async fn init(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     set_backlight(forth)?;
     Ok(())
 }
+
+async fn get_spi_id(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let vals = forth.host_ctxt.spif.get_id().await;
+    writeln!(&mut forth.output, "SPI said: {:02X?}\r", &vals)?;
+
+    Ok(())
+}
+
 
 async fn blank_line(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     let idx = unsafe { forth.data_stack.try_pop()?.data } as u8;
@@ -225,6 +238,21 @@ fn set_backlight(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
     forth.host_ctxt.lcd.backlight.set_config(&config);
 
     Ok(())
+}
+
+// idx amt set_led
+fn set_led(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
+    let amt = unsafe { forth.data_stack.try_pop()?.data };
+    let amt = amt.max(0).min(u16::MAX.into());
+    let amt = amt as u16;
+
+    let idx = unsafe { forth.data_stack.try_pop()?.data } as u8;
+
+    forth
+        .host_ctxt
+        .leds
+        .set_led(idx, amt)
+        .map_err(|_| forth3::Error::BadLiteral)
 }
 
 async fn init_disp(forth: &mut Forth<RobertCtx>) -> Result<(), forth3::Error> {
@@ -576,6 +604,7 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
         async_builtin!("font2"),
         async_builtin!("blank_line"),
         async_builtin!("print_line"),
+        async_builtin!("get_spi_id"),
     ];
 
     fn dispatch_async(
@@ -615,6 +644,7 @@ impl<'forth> AsyncBuiltins<'forth, RobertCtx> for RobertAsync {
                 "blank_line" => blank_line(forth).await,
                 "print_line" => print_line(forth).await,
                 "init" => init(forth).await,
+                "get_spi_id" => get_spi_id(forth).await,
                 // "set_smartled" => {
                 //     let val = forth.data_stack.try_pop()?;
                 //     let val = unsafe { val.data };
@@ -795,6 +825,7 @@ pub const ROBERT_BUILTINS: &[BuiltinEntry<RobertCtx>] = &[
     // builtin!("set_gamma", set_gamma),
     // builtin!("set_brightness", set_brightness),
     builtin!("set_backlight", set_backlight),
+    builtin!("set_led", set_led),
     //
     // Math operations
     //
